@@ -10,4 +10,12 @@ install(DIRECTORY
   DESTINATION share/${PROJECT_NAME}
 )
 
+install(PROGRAMS
+  scripts/obstacle_avoidance.py
+  scripts/robot_state_monitor.py
+  scripts/move_forward.py
+  scripts/diag_lidar.py
+  DESTINATION lib/${PROJECT_NAME}
+)
+
 ament_package()

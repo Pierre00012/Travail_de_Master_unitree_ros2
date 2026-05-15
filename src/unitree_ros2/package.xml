@@ -11,6 +11,9 @@
 
   <exec_depend>rtabmap_ros</exec_depend>
   <exec_depend>rtabmap_viz</exec_depend>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>sensor_msgs_py</exec_depend>
 
   <export>
     <build_type>ament_cmake</build_type>
