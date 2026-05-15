@@ -25,6 +25,10 @@ class ObstacleAvoidance(Node):
         self.start_time = time.time()
         self.startup_delay = 10.0  # secondes
         self.turn_direction    = 0.0    # 0 = tout droit
+        self.startup_escape = False
+
+        # temps début manoeuvre
+        self.escape_start_time = 0.0
 
         # ===== ROS =====
         self.sub = self.create_subscription(
@@ -101,21 +105,33 @@ class ObstacleAvoidance(Node):
 
         # attendre 10 secondes avant mouvement
         elapsed = time.time() - self.start_time
+        # ==========================
+        # MODE DEGAGEMENT
+        # ==========================
+        if self.startup_escape:
+            self.danger_startup()
+            return
+
+        # ==========================
+        # DELAI INITIALISATION
+        # ==========================
         if elapsed < self.startup_delay:
+
+            # danger immédiat pendant startup
+            if self.front_dist < self.critical_distance:
+
+                self.get_logger().info(
+                    '🚨 Obstacle trop proche au démarrage'
+                )
+
+                self.startup_escape = True
+                self.escape_start_time = time.time()
+
+                return
+
             self.get_logger().info(
                 f'Initialisation capteurs... {elapsed:.1f}/10s'
             )
-            msg = Request()
-            msg.header.identity.id = 1
-            msg.header.identity.api_id = 1008
-
-            # robot immobile
-            velocity = {"x": 0.0, "y": 0.0, "z": 0.0}
-
-            msg.parameter = json.dumps(velocity)
-            self.pub.publish(msg)
-
-            return
 
         msg = Request()
         msg.header.identity.id     = 1
@@ -191,7 +207,68 @@ class ObstacleAvoidance(Node):
         msg.parameter = json.dumps(velocity)
         self.pub.publish(msg)
 
+    # ==========================
+    # danger au démarrage
+    # Treculer et tourner
+    # ==========================
+    def danger_startup(self):
 
+        msg = Request()
+        msg.header.identity.id = 1
+        msg.header.identity.api_id = 1008
+
+        elapsed_escape = time.time() - self.escape_start_time
+
+        # ==========================
+        # Phase 1 : reculer
+        # ==========================
+        if elapsed_escape < 2.0:
+
+            self.get_logger().info(
+                '🚨 Danger immédiat au démarrage -> recul'
+            )
+
+            velocity = {
+                "x": -0.25,
+                "y": 0.0,
+                "z": 0.0
+            }
+
+        # ==========================
+        # Phase 2 : tourner
+        # ==========================
+        elif elapsed_escape < 4.0:
+
+            self.get_logger().info(
+                '↩️ Rotation de dégagement'
+            )
+
+            # tourne vers le côté le plus libre
+            if self.left_dist >= self.right_dist:
+                vz = 0.8
+            else:
+                vz = -0.8
+
+            velocity = {
+                "x": 0.0,
+                "y": 0.0,
+                "z": vz
+            }
+
+        # ==========================
+        # Fin procédure
+        # ==========================
+        else:
+
+            self.get_logger().info(
+                '✅ Dégagement terminé'
+            )
+
+            self.startup_escape = False
+            return
+
+        msg.parameter = json.dumps(velocity)
+        self.pub.publish(msg)
 def main():
     rclpy.init()
     node = ObstacleAvoidance()
