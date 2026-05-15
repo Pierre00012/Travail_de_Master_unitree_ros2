@@ -7,7 +7,7 @@ from sensor_msgs_py import point_cloud2
 from unitree_api.msg import Request
 import json
 import math
-
+import time
 class ObstacleAvoidance(Node):
 
     def __init__(self):
@@ -22,6 +22,8 @@ class ObstacleAvoidance(Node):
         self.left_dist         = 999.0
         self.right_dist        = 999.0
         self.front_dist        = 999.0
+        self.start_time = time.time()
+        self.startup_delay = 10.0  # secondes
         self.turn_direction    = 0.0    # 0 = tout droit
 
         # ===== ROS =====
@@ -96,6 +98,24 @@ class ObstacleAvoidance(Node):
     # CONTROL LOOP — toujours en mouvement
     # ===================================
     def control_loop(self):
+
+        # attendre 10 secondes avant mouvement
+        elapsed = time.time() - self.start_time
+        if elapsed < self.startup_delay:
+            self.get_logger().info(
+                f'Initialisation capteurs... {elapsed:.1f}/10s'
+            )
+            msg = Request()
+            msg.header.identity.id = 1
+            msg.header.identity.api_id = 1008
+
+            # robot immobile
+            velocity = {"x": 0.0, "y": 0.0, "z": 0.0}
+
+            msg.parameter = json.dumps(velocity)
+            self.pub.publish(msg)
+
+            return
 
         msg = Request()
         msg.header.identity.id     = 1
