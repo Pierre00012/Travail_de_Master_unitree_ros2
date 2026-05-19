@@ -58,10 +58,15 @@ class ObstacleAvoidance(Node):
     # ==========================
     # moyenne history
     # ==========================
+    
+
     def smooth(self, history):
         if len(history) == 0:
             return 999.0
-        return sum(history) / len(history)
+        valid = [v for v in history if v < 50.0]
+        if len(valid) == 0:
+            return 999.0
+        return sum(valid) / len(valid)
 
     # ===================================
     # LIDAR — analyse 3 zones : gauche / centre / droite
@@ -237,7 +242,7 @@ class ObstacleAvoidance(Node):
                     (self.obstacle_distance - self.critical_distance)
 
             vx = 0.15 + ratio * 0.15
-            vz = self.turn_direction * 0.7
+            vz = self.turn_direction * 1.8
 
         # ==========================
         # CAS 3 : danger immédiat

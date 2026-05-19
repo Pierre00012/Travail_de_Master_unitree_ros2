@@ -15,6 +15,7 @@ install(PROGRAMS
   scripts/robot_state_monitor.py
   scripts/move_forward.py
   scripts/diag_lidar.py
+  scripts/diag_z.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
