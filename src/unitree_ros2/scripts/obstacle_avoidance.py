@@ -8,6 +8,8 @@ from unitree_api.msg import Request
 import json
 import math
 import time
+
+
 class ObstacleAvoidance(Node):
 
     def __init__(self):
@@ -22,10 +24,22 @@ class ObstacleAvoidance(Node):
         self.left_dist         = 999.0
         self.right_dist        = 999.0
         self.front_dist        = 999.0
+
+        # pour gerer le demarrage 
         self.start_time = time.time()
         self.startup_delay = 10.0  # secondes
+
         self.turn_direction    = 0.0    # 0 = tout droit
         self.startup_escape = False
+
+        # pour gerer les virages 
+        self.history_size = 5
+        self.left_history = []
+        self.right_history = []
+
+        self.direction_lock = 0      # 0 = libre, 1 = gauche, -1 = droite
+        self.lock_time = 0
+        self.lock_duration = 1.5     # secondes
 
         # temps début manoeuvre
         self.escape_start_time = 0.0
@@ -40,6 +54,14 @@ class ObstacleAvoidance(Node):
         self.timer = self.create_timer(0.05, self.control_loop)
 
         self.get_logger().info('Obstacle Avoidance Started')
+
+    # ==========================
+    # moyenne history
+    # ==========================
+    def smooth(self, history):
+        if len(history) == 0:
+            return 999.0
+        return sum(history) / len(history)
 
     # ===================================
     # LIDAR — analyse 3 zones : gauche / centre / droite
@@ -86,16 +108,24 @@ class ObstacleAvoidance(Node):
                     right_dist = d
 
         self.front_dist = front_dist
-        self.left_dist  = left_dist
-        self.right_dist = right_dist
 
-        # Distance minimale globale
-        self.closest_distance = min(front_dist, left_dist, right_dist)
+        # ===== HISTORY (lissage) =====
+        self.left_history.append(left_dist)
+        self.right_history.append(right_dist)
+
+        if len(self.left_history) > self.history_size:
+            self.left_history.pop(0)
+
+        if len(self.right_history) > self.history_size:
+            self.right_history.pop(0)
+
+        self.left_dist = self.smooth(self.left_history)
+        self.right_dist = self.smooth(self.right_history)
+
+        self.closest_distance = min(front_dist, self.left_dist, self.right_dist)
 
         self.get_logger().info(
-            f'front={front_dist:.2f}m | '
-            f'gauche={left_dist:.2f}m | '
-            f'droite={right_dist:.2f}m'
+            f'front={front_dist:.2f}m | gauche={self.left_dist:.2f}m | droite={self.right_dist:.2f}m'
         )
 
     # ===================================
@@ -103,8 +133,8 @@ class ObstacleAvoidance(Node):
     # ===================================
     def control_loop(self):
 
-        # attendre 10 secondes avant mouvement
         elapsed = time.time() - self.start_time
+
         # ==========================
         # MODE DEGAGEMENT
         # ==========================
@@ -117,7 +147,6 @@ class ObstacleAvoidance(Node):
         # ==========================
         if elapsed < self.startup_delay:
 
-            # danger immédiat pendant startup
             if self.front_dist < self.critical_distance:
 
                 self.get_logger().info(
@@ -126,15 +155,16 @@ class ObstacleAvoidance(Node):
 
                 self.startup_escape = True
                 self.escape_start_time = time.time()
-
                 return
 
             self.get_logger().info(
                 f'Initialisation capteurs... {elapsed:.1f}/10s'
             )
 
+            return
+
         msg = Request()
-        msg.header.identity.id     = 1
+        msg.header.identity.id = 1
         msg.header.identity.api_id = 1008
 
         front = self.front_dist
@@ -145,60 +175,83 @@ class ObstacleAvoidance(Node):
         # CAS 1 : voie totalement libre
         # ==========================
         if front > self.obstacle_distance:
-            # Avance tout droit, vitesse normale
+
             vx = 0.3
             vz = 0.0
             self.turn_direction = 0.0
 
         # ==========================
         # CAS 2 : obstacle détecté à distance
-        # Amorce un virage SANS s'arrêter
         # ==========================
         elif front > self.critical_distance:
 
-            # Choisit le côté le plus libre
-            # Si en train de tourner, vérifie que c'est toujours ok
-            if self.turn_direction > 0:
-                # Tournait à gauche — gauche bloquée ? → droite
-                if left < self.critical_distance:
-                    self.turn_direction = -1.0
-                    self.get_logger().info('↩️  Gauche bloquée → bascule à droite')
-            elif self.turn_direction < 0:
-                # Tournait à droite — droite bloquée ? → gauche
-                if right < self.critical_distance:
-                    self.turn_direction = 1.0
-                    self.get_logger().info('↩️  Droite bloquée → bascule à gauche')
-            else:
-                # Nouveau choix : côté le plus dégagé
-                if left >= right:
-                    self.turn_direction = 1.0
-                    self.get_logger().info(
-                        f'🔄 Virage GAUCHE anticipé '
-                        f'(gauche={left:.2f}m > droite={right:.2f}m)')
-                else:
-                    self.turn_direction = -1.0
-                    self.get_logger().info(
-                        f'🔄 Virage DROITE anticipé '
-                        f'(droite={right:.2f}m > gauche={left:.2f}m)')
+            margin = 0.15
 
-            # Avance EN tournant — vitesse proportionnelle à la distance
+            # ==========================
+            # VERROU DE DIRECTION
+            # ==========================
+            if self.direction_lock != 0:
+                if time.time() - self.lock_time < self.lock_duration:
+                    self.turn_direction = float(self.direction_lock)
+                else:
+                    self.direction_lock = 0
+
+            else:
+
+                # maintien direction
+                if self.turn_direction > 0:
+                    if self.left_dist < self.critical_distance:
+                        self.turn_direction = -1.0
+                        self.direction_lock = -1
+                        self.lock_time = time.time()
+
+                elif self.turn_direction < 0:
+                    if self.right_dist < self.critical_distance:
+                        self.turn_direction = 1.0
+                        self.direction_lock = 1
+                        self.lock_time = time.time()
+
+                else:
+
+                    if left > right + margin:
+                        new_direction = 1.0
+                        self.direction_lock = 1
+                        self.lock_time = time.time()
+
+                    elif right > left + margin:
+                        new_direction = -1.0
+                        self.direction_lock = -1
+                        self.lock_time = time.time()
+
+                    else:
+                        new_direction = 1.0
+                        self.direction_lock = 1
+                        self.lock_time = time.time()
+
+                    self.turn_direction = (
+                        self.turn_direction * 0.8 +
+                        new_direction * 0.2
+                    )
+
             ratio = (front - self.critical_distance) / \
                     (self.obstacle_distance - self.critical_distance)
-            vx = 0.15 + ratio * 0.15   # entre 0.15 et 0.30 m/s
+
+            vx = 0.15 + ratio * 0.15
             vz = self.turn_direction * 0.7
 
         # ==========================
         # CAS 3 : danger immédiat
-        # Tourne sur place sans avancer
         # ==========================
         else:
-            if left >= right:
+
+            if self.left_dist >= self.right_dist:
                 self.turn_direction = 1.0
             else:
                 self.turn_direction = -1.0
 
             self.get_logger().info(
-                f'🚨 DANGER {front:.2f}m — rotation sur place')
+                f'🚨 DANGER {front:.2f}m — rotation sur place'
+            )
 
             vx = 0.0
             vz = self.turn_direction * 0.8
@@ -209,7 +262,6 @@ class ObstacleAvoidance(Node):
 
     # ==========================
     # danger au démarrage
-    # Treculer et tourner
     # ==========================
     def danger_startup(self):
 
@@ -219,45 +271,27 @@ class ObstacleAvoidance(Node):
 
         elapsed_escape = time.time() - self.escape_start_time
 
-        # ==========================
-        # Phase 1 : reculer
-        # ==========================
         if elapsed_escape < 2.0:
 
             self.get_logger().info(
                 '🚨 Danger immédiat au démarrage -> recul'
             )
 
-            velocity = {
-                "x": -0.25,
-                "y": 0.0,
-                "z": 0.0
-            }
+            velocity = {"x": -0.25, "y": 0.0, "z": 0.0}
 
-        # ==========================
-        # Phase 2 : tourner
-        # ==========================
         elif elapsed_escape < 4.0:
 
             self.get_logger().info(
                 '↩️ Rotation de dégagement'
             )
 
-            # tourne vers le côté le plus libre
             if self.left_dist >= self.right_dist:
                 vz = 0.8
             else:
                 vz = -0.8
 
-            velocity = {
-                "x": 0.0,
-                "y": 0.0,
-                "z": vz
-            }
+            velocity = {"x": 0.0, "y": 0.0, "z": vz}
 
-        # ==========================
-        # Fin procédure
-        # ==========================
         else:
 
             self.get_logger().info(
@@ -269,12 +303,15 @@ class ObstacleAvoidance(Node):
 
         msg.parameter = json.dumps(velocity)
         self.pub.publish(msg)
+
+
 def main():
     rclpy.init()
     node = ObstacleAvoidance()
     rclpy.spin(node)
     node.destroy_node()
     rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()
