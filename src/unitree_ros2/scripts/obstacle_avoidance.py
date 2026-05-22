@@ -44,6 +44,14 @@ class ObstacleAvoidance(Node):
         # temps début manoeuvre
         self.escape_start_time = 0.0
 
+        # gestion du danger pendant navigation
+        self.danger_escape = False
+        self.danger_escape_start_time = 0.0
+
+        # détection du danger 999.00 persistant (obstacle bloquant)
+        self.danger_999_count = 0
+        self.danger_999_threshold = 5  # 5 observations = danger
+
         # ===== ROS =====
         self.sub = self.create_subscription(
             PointCloud2, '/utlidar/cloud', self.lidar_callback, 10)
@@ -58,15 +66,10 @@ class ObstacleAvoidance(Node):
     # ==========================
     # moyenne history
     # ==========================
-    
-
     def smooth(self, history):
         if len(history) == 0:
             return 999.0
-        valid = [v for v in history if v < 50.0]
-        if len(valid) == 0:
-            return 999.0
-        return sum(valid) / len(valid)
+        return sum(history) / len(history)
 
     # ===================================
     # LIDAR — analyse 3 zones : gauche / centre / droite
@@ -114,6 +117,12 @@ class ObstacleAvoidance(Node):
 
         self.front_dist = front_dist
 
+        # ===== DETECTION DANGER 999.00 PERSISTANT =====
+        if front_dist >= 999.0:
+            self.danger_999_count += 1
+        else:
+            self.danger_999_count = 0  # Réinitialiser si détection normale
+
         # ===== HISTORY (lissage) =====
         self.left_history.append(left_dist)
         self.right_history.append(right_dist)
@@ -141,7 +150,14 @@ class ObstacleAvoidance(Node):
         elapsed = time.time() - self.start_time
 
         # ==========================
-        # MODE DEGAGEMENT
+        # MODE DEGAGEMENT DANGER PENDANT NAVIGATION
+        # ==========================
+        if self.danger_escape:
+            self.danger_escape_maneuver()
+            return
+
+        # ==========================
+        # MODE DEGAGEMENT DEMARRAGE
         # ==========================
         if self.startup_escape:
             self.danger_startup()
@@ -175,6 +191,24 @@ class ObstacleAvoidance(Node):
         front = self.front_dist
         left  = self.left_dist
         right = self.right_dist
+
+        # ==========================
+        # DETECTION URGENCE : 999.00 persistant (5+ obs)
+        # ==========================
+        if self.danger_999_count >= self.danger_999_threshold:
+            self.get_logger().info(
+                f'🚨🚨 DANGER CRITIQUE - Obstacle bloquant détecté ! ({self.danger_999_count} obs 999.00) - RECUL URGENT'
+            )
+            
+            # Arrêt immédiat
+            velocity = {"x": 0.0, "y": 0.0, "z": 0.0}
+            msg.parameter = json.dumps(velocity)
+            self.pub.publish(msg)
+            
+            # Déclencher dégagement
+            self.danger_escape = True
+            self.danger_escape_start_time = time.time()
+            return
 
         # ==========================
         # CAS 1 : voie totalement libre
@@ -242,26 +276,92 @@ class ObstacleAvoidance(Node):
                     (self.obstacle_distance - self.critical_distance)
 
             vx = 0.15 + ratio * 0.15
-            vz = self.turn_direction * 1.8
+            vz = self.turn_direction * (0.5 + 0.5 * ratio)
 
         # ==========================
         # CAS 3 : danger immédiat
         # ==========================
         else:
 
-            if self.left_dist >= self.right_dist:
-                self.turn_direction = 1.0
-            else:
-                self.turn_direction = -1.0
-
             self.get_logger().info(
-                f'🚨 DANGER {front:.2f}m — rotation sur place'
+                f'🚨 DANGER {front:.2f}m — activation dégagement'
             )
 
-            vx = 0.0
-            vz = self.turn_direction * 0.8
+            # Publier arrêt immédiat
+            velocity = {"x": 0.0, "y": 0.0, "z": 0.0}
+            msg.parameter = json.dumps(velocity)
+            self.pub.publish(msg)
+
+            # Activer mode dégagement pour les prochaines itérations
+            self.danger_escape = True
+            self.danger_escape_start_time = time.time()
+            return
 
         velocity = {"x": vx, "y": 0.0, "z": vz}
+        msg.parameter = json.dumps(velocity)
+        self.pub.publish(msg)
+
+    # ==========================
+    # dégagement danger pendant navigation
+    # ==========================
+    def danger_escape_maneuver(self):
+
+        msg = Request()
+        msg.header.identity.id = 1
+        msg.header.identity.api_id = 1008
+
+        elapsed_escape = time.time() - self.danger_escape_start_time
+
+        # Phase 1 : Recul 1m (4 secondes à -0.25 m/s)
+        if elapsed_escape < 4.0:
+
+            self.get_logger().info(
+                f'🚨 Danger -> recul de dégagement ({elapsed_escape:.1f}s)'
+            )
+
+            velocity = {"x": -0.25, "y": 0.0, "z": 0.0}
+
+        # Phase 2 : Rotation après le recul (2 secondes)
+        elif elapsed_escape < 6.0:
+
+            self.get_logger().info(
+                '↩️ Rotation de dégagement'
+            )
+
+            if self.left_dist >= self.right_dist:
+                vz = 0.8
+            else:
+                vz = -0.8
+
+            velocity = {"x": 0.0, "y": 0.0, "z": vz}
+
+        # Phase 3 : Vérifier que la voie est vraiment libre avant de terminer
+        else:
+
+            # Vérifier que toutes les directions sont dégagées
+            if (self.front_dist > self.obstacle_distance and 
+                self.left_dist > self.critical_distance and 
+                self.right_dist > self.critical_distance):
+
+                self.get_logger().info(
+                    '✅ Dégagement terminé - voie libre confirmée'
+                )
+
+                self.danger_escape = False
+                return
+            else:
+                # Voie encore obstruée, reconduire la rotation
+                self.get_logger().info(
+                    f'⏸️ Voie encore dangereuse - poursuite rotation (F:{self.front_dist:.2f} L:{self.left_dist:.2f} R:{self.right_dist:.2f})'
+                )
+
+                if self.left_dist >= self.right_dist:
+                    vz = 0.8
+                else:
+                    vz = -0.8
+
+                velocity = {"x": 0.0, "y": 0.0, "z": vz}
+
         msg.parameter = json.dumps(velocity)
         self.pub.publish(msg)
 
