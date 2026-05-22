@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+"""Diagnostic lidar pour détecter les points proches devant le robot.
+
+Ce script sert à vérifier la qualité du nuage lidar frontal et détecter
+les zones mortes devant le robot.
+"""
+
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import PointCloud2
@@ -15,7 +21,8 @@ class DiagLidar(Node):
         points = list(point_cloud2.read_points(
             msg, field_names=("x","y","z"), skip_nans=True))
 
-        # Tous les points devant (x négatif) sans aucun filtre
+        # Diagnostic frontal : on récupère les points devant le robot
+        # sans filtre de hauteur pour détecter les zones mortes.
         front = []
         for p in points:
             x, y, z = p

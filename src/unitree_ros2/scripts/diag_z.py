@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+"""Outil de diagnostic lidar pour détecter les zones mortes devant le robot."""
+
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import PointCloud2
@@ -15,11 +17,13 @@ class DiagZ(Node):
         points = list(point_cloud2.read_points(
             msg, field_names=("x", "y", "z"), skip_nans=True))
 
+        # On recherche les points proches devant le robot pour détecter
+        # les zones mortes ou angles morts dans le champ lidar.
         front = []
         for p in points:
             x, y, z = p
 
-            # Filtres de base uniquement
+            # Filtres de base uniquement pour conserver la zone devant le robot
             if x > -0.35:
                 continue
             if abs(y) > 0.30:
@@ -27,7 +31,7 @@ class DiagZ(Node):
             if abs(x) < 0.8 and abs(y) < 0.45:
                 continue
 
-            # PAS de filtre z → on veut tout voir
+            # PAS de filtre z → on veut analyser toute la hauteur
             d = math.sqrt(x*x + y*y + z*z)
             if d < 0.5 or d > 2.0:
                 continue
