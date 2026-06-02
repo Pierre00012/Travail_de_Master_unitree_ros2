@@ -12,7 +12,7 @@ install(DIRECTORY
 
 install(PROGRAMS
   scripts/obstacle_avoidance.py
-  scripts/robot_state_monitor.py
+  #scripts/rtabmap_go2.launch.py
   scripts/move_forward.py
   scripts/diag_lidar.py
   scripts/diag_z.py

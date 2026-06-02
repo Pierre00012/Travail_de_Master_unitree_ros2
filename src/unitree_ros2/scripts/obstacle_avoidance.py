@@ -307,14 +307,15 @@ class ObstacleAvoidance(Node):
         }
         phase1_end, phase2_end = phase_times.get(escape_type, phase_times['danger'])
 
-        # Phase 1: Recul
+        # Phase 1: Recul avec rotation de recherche
         if elapsed < phase1_end:
-            self.get_logger().info(f'🚨 Recul dégagement ({elapsed:.1f}s)')
-            self._publish_velocity(self.SPEED_BACKWARD, 0.0)
+            self.get_logger().info(f'🚨 Recul + rotation de dégagement ({elapsed:.1f}s)')
+            vz = self._get_rotation_direction() * self.SPEED_TURN_ESCAPE
+            self._publish_velocity(self.SPEED_BACKWARD, vz)
 
-        # Phase 2: Rotation
+        # Phase 2: Rotation pure
         elif elapsed < phase2_end:
-            self.get_logger().info('↩️ Rotation dégagement')
+            self.get_logger().info('↩️ Rotation pure de dégagement')
             vz = self._get_rotation_direction() * self.SPEED_TURN_ESCAPE
             self._publish_velocity(0.0, vz)
 
