@@ -13,9 +13,15 @@ import time
 class ObstacleAvoidance(Node):
 
     # CONSTANTES - Tuning du robot
-    OBSTACLE_DISTANCE = 1.2
+    OBSTACLE_DISTANCE = 2.0
+    PROXIMITY_DISTANCE = 1.5
+    MID_DISTANCE = 0.8
     CRITICAL_DISTANCE = 0.7
     MIN_LIDAR_DISTANCE = 0.5
+    ROBOT_WIDTH = 0.27
+    SAFETY_MARGIN = 0.05
+    BIAS_FRAME_COUNT = 5
+    BIAS_OBSERVE_DURATION = 3.0
     LIDAR_MAX_X = -0.35
     LIDAR_MAX_Y = 0.30
     LIDAR_BLIND_ZONE_X = 0.5
@@ -59,6 +65,9 @@ class ObstacleAvoidance(Node):
         self.right_history = []
         self.direction_lock = 0
         self.lock_time = 0
+        self.bias_state = None
+        self.bias_start_time = 0.0
+        self.bias_side = 0.0
         
         # Dangers
         self.danger_999_count = 0
@@ -86,10 +95,10 @@ class ObstacleAvoidance(Node):
         msg.header.identity.api_id = 1008
         return msg
     
-    def _publish_velocity(self, vx, vz):
+    def _publish_velocity(self, vx, vz, vy=0.0):
         """Publie une commande de velocité"""
         msg = self._create_request_msg()
-        velocity = {"x": vx, "y": 0.0, "z": vz}
+        velocity = {"x": vx, "y": vy, "z": vz}
         msg.parameter = json.dumps(velocity)
         self.pub.publish(msg)
     
@@ -199,6 +208,14 @@ class ObstacleAvoidance(Node):
             self._escape_sequence(self.escape_start_time, 'startup')
             return
 
+        # Mode marche en biais: 5 frames de biais puis observation 3s
+        if self.state == 'BIAS_MOVE':
+            self._bias_move()
+            return
+        if self.state == 'BIAS_OBSERVE':
+            self._bias_observe()
+            return
+
         # Mode escape danger pendant navigation
         if self.state == 'ESCAPE_DANGER':
             self._escape_sequence(self.escape_start_time, 'danger')
@@ -218,7 +235,7 @@ class ObstacleAvoidance(Node):
         self._navigate_normal()
 
     def _navigate_normal(self):
-        """Navigation en mode normal (3 cas)"""
+        """Navigation en mode normal (3 cas)."""
         front = self.front_dist
         left = self.left_dist
         right = self.right_dist
@@ -236,9 +253,21 @@ class ObstacleAvoidance(Node):
             self._publish_velocity(self.SPEED_MIN_FORWARD, vz)
             return
 
-        # CAS 2: obstacle détecté à distance
-        if front > self.CRITICAL_DISTANCE:
+        # CAS 2: obstacle à distance moyenne/loin
+        if front > self.PROXIMITY_DISTANCE:
+            self.get_logger().info(f'🟡 Obstacle à distance {front:.2f}m - virage engagé')
             self._navigate_with_obstacle(front, left, right)
+            return
+
+        # CAS 2.5: marche en biais
+        if front > self.MID_DISTANCE and front <= self.PROXIMITY_DISTANCE:
+            self._start_bias_move(left, right)
+            return
+
+        # CAS 2.8: très proche mais pas critique
+        if front > self.CRITICAL_DISTANCE and front <= self.MID_DISTANCE:
+            self.get_logger().info(f'🟠 Obstacle serré {front:.2f}m - virage lent')
+            self._navigate_with_obstacle(front, left, right, slow=True)
             return
 
         # CAS 3: danger immédiat
@@ -247,9 +276,8 @@ class ObstacleAvoidance(Node):
         self.state = 'ESCAPE_DANGER'
         self.escape_start_time = time.time()
 
-    def _navigate_with_obstacle(self, front, left, right):
-        """Gère la navigation avec obstacle détecté (CAS 2)"""
-        # Gestion du verrou de direction
+    def _navigate_with_obstacle(self, front, left, right, slow=False):
+        """Gère la navigation avec obstacle détecté (CAS 2)."""
         if self.direction_lock != 0:
             if time.time() - self.lock_time < self.DIRECTION_LOCK_DURATION:
                 self.turn_direction = float(self.direction_lock)
@@ -258,11 +286,12 @@ class ObstacleAvoidance(Node):
         else:
             self._update_turn_direction(left, right)
 
-        # Calcul des vitesses proportionnelles
         ratio = (front - self.CRITICAL_DISTANCE) / (self.OBSTACLE_DISTANCE - self.CRITICAL_DISTANCE)
+        ratio = max(0.0, min(1.0, ratio))
         vx = self.SPEED_MIN_FORWARD + ratio * (self.SPEED_MAX_FORWARD - self.SPEED_MIN_FORWARD)
-        vz = self.turn_direction * (0.5 + 0.5 * ratio)
-
+        if slow:
+            vx = self.SPEED_MIN_FORWARD * 0.8
+        vz = self.turn_direction * (0.4 + 0.4 * ratio)
         self._publish_velocity(vx, vz)
 
     def _update_turn_direction(self, left, right):
@@ -292,53 +321,110 @@ class ObstacleAvoidance(Node):
             self.turn_direction = (self.turn_direction * (1 - self.SMOOTH_BLEND_FACTOR) +
                                    new_direction * self.SMOOTH_BLEND_FACTOR)
 
+    def _choose_best_side(self, left, right):
+        """Retourne le meilleur côté à utiliser selon la largeur libre mesurée."""
+        half_width = self.ROBOT_WIDTH / 2.0
+        left_clearance = left - (half_width + self.SAFETY_MARGIN)
+        right_clearance = right - (half_width + self.SAFETY_MARGIN)
+        if left_clearance >= right_clearance:
+            return 1.0, left_clearance, right_clearance
+        return -1.0, left_clearance, right_clearance
+
+    def _start_bias_move(self, left, right):
+        if self.state == 'BIAS_MOVE' or self.state == 'BIAS_OBSERVE':
+            return
+
+        self.bias_side, left_clearance, right_clearance = self._choose_best_side(left, right)
+        self.bias_state = 'MOVE'
+        self.bias_start_time = time.time()
+        self.state = 'BIAS_MOVE'
+        self.turn_direction = self.bias_side
+        self.direction_lock = int(self.bias_side)
+        self.lock_time = time.time()
+        self.get_logger().info(
+            f'↗️ Début marche en biais côté {"GAUCHE" if self.bias_side > 0 else "DROITE"} '
+            f'(L={left_clearance:.2f}m R={right_clearance:.2f}m)'
+        )
+
+    def _bias_move(self):
+        elapsed = time.time() - self.bias_start_time
+        duration = self.BIAS_FRAME_COUNT * 0.05
+        if elapsed < duration:
+            vy = self.bias_side * (self.SPEED_FORWARD * 0.6)
+            self._publish_velocity(0.0, 0.0, vy)
+            return
+
+        self.get_logger().info('⏸️ Marche en biais terminée, observation 3s')
+        self.state = 'BIAS_OBSERVE'
+        self.bias_start_time = time.time()
+        self._publish_velocity(0.0, 0.0, 0.0)
+
+    def _bias_observe(self):
+        elapsed = time.time() - self.bias_start_time
+        if elapsed < self.BIAS_OBSERVE_DURATION:
+            self._publish_velocity(0.0, 0.0)
+            return
+
+        self.bias_state = None
+        self.state = 'RUNNING'
+        self.bias_start_time = 0.0
+        self.get_logger().info('✅ Observation terminée, retour navigation normale')
+        self.turn_direction, left_clearance, right_clearance = self._choose_best_side(
+            self.left_dist, self.right_dist
+        )
+        self.direction_lock = int(self.turn_direction)
+        self.lock_time = time.time()
+
     def _escape_sequence(self, start_time, escape_type):
-        """Séquence unifiée de dégagement: recul + rotation + vérification
+        """Séquence unifiée de dégagement: recul court + rotation choisie + vérification.
         
         Args:
             start_time: timestamp du début du dégagement
             escape_type: 'startup' ou 'danger' pour les logs
         """
         elapsed = time.time() - start_time
-        phase_times = {
-            'startup': (2.0, 4.0),  # phase1_end, phase2_end
-            'danger': (self.ESCAPE_PHASE1_DURATION, 
-                      self.ESCAPE_PHASE1_DURATION + self.ESCAPE_PHASE2_DURATION)
-        }
-        phase1_end, phase2_end = phase_times.get(escape_type, phase_times['danger'])
+        back_duration = self.BIAS_FRAME_COUNT * 0.05
+        rotation_duration = 3.0
+        total_timeout = 15.0
 
-        # Phase 1: Recul avec rotation de recherche
-        if elapsed < phase1_end:
-            self.get_logger().info(f'🚨 Recul + rotation de dégagement ({elapsed:.1f}s)')
-            vz = self._get_rotation_direction() * self.SPEED_TURN_ESCAPE
-            self._publish_velocity(self.SPEED_BACKWARD, vz)
+        # Phase 1: recul pur sur 5 frames
+        if elapsed < back_duration:
+            self.get_logger().info(f'🔙 Recul pur ({elapsed:.2f}s/{back_duration:.2f}s)')
+            self._publish_velocity(self.SPEED_BACKWARD, 0.0)
+            return
 
-        # Phase 2: Rotation pure
-        elif elapsed < phase2_end:
-            self.get_logger().info('↩️ Rotation pure de dégagement')
-            vz = self._get_rotation_direction() * self.SPEED_TURN_ESCAPE
+        # Phase 2: rotation choisie vers le meilleur côté
+        if elapsed < back_duration + rotation_duration:
+            best_side, left_clearance, right_clearance = self._choose_best_side(
+                self.left_dist, self.right_dist
+            )
+            self.get_logger().info(
+                f'↩️ Rotation dégagement côté {"GAUCHE" if best_side > 0 else "DROITE"} '
+                f'(L={left_clearance:.2f}m R={right_clearance:.2f}m)'
+            )
+            vz = best_side * self.SPEED_TURN_ESCAPE
             self._publish_velocity(0.0, vz)
+            return
 
-        # Phase 3: Vérification + retry
-        else:
-            if elapsed > self.ESCAPE_TOTAL_TIMEOUT:
-                self.get_logger().warn('⏱️ Timeout dégagement - forcer continuation')
-                self.state = 'RUNNING'
-                return
-
-            # Vérifier voie libre
+        # Phase 3: vérification + retry
+        if elapsed < total_timeout:
             if (self.front_dist > self.OBSTACLE_DISTANCE and
                 self.left_dist > self.CRITICAL_DISTANCE and
                 self.right_dist > self.CRITICAL_DISTANCE):
                 self.get_logger().info('✅ Dégagement réussi!')
                 self.state = 'RUNNING'
-            else:
-                # Continuer rotation
-                self.get_logger().info(
-                    f'Voie obstruée (F:{self.front_dist:.2f} L:{self.left_dist:.2f} R:{self.right_dist:.2f}) - rotation'
-                )
-                vz = self._get_rotation_direction() * self.SPEED_TURN_ESCAPE
-                self._publish_velocity(0.0, vz)
+                return
+
+            self.get_logger().info(
+                f'Voie obstruée (F:{self.front_dist:.2f} L:{self.left_dist:.2f} R:{self.right_dist:.2f}) - rotation continue'
+            )
+            vz = self._get_rotation_direction() * self.SPEED_TURN_ESCAPE
+            self._publish_velocity(0.0, vz)
+            return
+
+        self.get_logger().warn('⏱️ Timeout dégagement - retour navigation')
+        self.state = 'RUNNING'
+        self._publish_velocity(0.0, 0.0)
 
 
 def main():

@@ -68,18 +68,18 @@ def generate_launch_description():
 
                 # ── ICP pour LiDAR 3D ──
                 'Reg/Strategy':           '1',      # ICP
-                'Icp/VoxelSize':          '0.1',
-                'Icp/MaxCorrespondenceDistance': '0.2',
+                'Icp/VoxelSize':          '0.05',
+                'Icp/MaxCorrespondenceDistance': '0.18',
                 'Icp/PointToPlane':       'true',
-                'Icp/Iterations':         '30',
+                'Icp/Iterations':         '40',
                 'Icp/MaxTranslation':     '0.5',
                 'Icp/MaxRotation':        '0.5',
 
-                # ── Grille 2D occupancy ──
+                # ── Grille 2D / 3D occupancy ──
                 'Grid/FromDepth':         'false',
                 'Grid/RayTracing':        'true',
                 'Grid/CellSize':          '0.05',
-                'Grid/3D':                'false',
+                'Grid/3D':                'true',
                 'Grid/UnknownSpaceFilled': 'false',
                 'Grid/MaxObstacleHeight': '0.6',
                 'Grid/MinGroundHeight':   '-0.1',
