@@ -15,6 +15,7 @@ install(PROGRAMS
   scripts/move_forward.py
   scripts/diag_lidar.py
   scripts/diag_z.py
+  scripts/mission_manager.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
