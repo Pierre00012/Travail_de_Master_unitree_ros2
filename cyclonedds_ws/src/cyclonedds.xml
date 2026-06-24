@@ -1,9 +1,9 @@
 <?xml version="1.0" encoding="UTF-8" ?>
-<CycloneDDS>
+<CycloneDDS xmlns="https://cdds.io/config">
     <Domain Id="any">
         <General>
             <Interfaces>
-                <NetworkInterface name="enp0s31f6" priority="default" multicast="default" />
+                <NetworkInterface name="enp0s31f6"/> 
             </Interfaces>
         </General>
     </Domain>
