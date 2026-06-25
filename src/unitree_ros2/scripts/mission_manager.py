@@ -2,130 +2,184 @@
 
 import rclpy
 from rclpy.node import Node
-from rclpy.action import ActionClient
-from nav2_msgs.action import NavigateToPose
 from unitree_api.msg import Request
+from nav_msgs.msg import Odometry
 import json
-import time  # Utilisé pour time.monotonic()
+import time
+import math
 
 class MissionManager(Node):
-
     def __init__(self):
         super().__init__('mission_manager')
 
-        # ===== CONFIGURATION =====
-        self.MISSION_DURATION = 60.0  # Durée de la mission en secondes
-        self.FREQUENCY = 1.0           # Fréquence du monitoring (1 Hz)
+        # ==================== CONFIG ====================
+        self.MISSION_DURATION = 30.0          # secondes
+        self.RETURN_LINEAR_SPEED = 0.22
+        self.RETURN_ANGULAR_SPEED = 1.2       # Rotation plus forte
+        self.POSITION_TOLERANCE = 0.25
+        self.ANGLE_TOLERANCE = 0.20
 
-        # ===== ETAT INTERNE IMMUNISÉ =====
-        # time.monotonic() renvoie le temps brut du CPU, insensible aux sauts de temps
-        self.start_time_mono = time.monotonic()
+        # Remplacement par time.monotonic() pour la stabilité réseau
+        self.start_time = time.monotonic()
+        self.return_phase = False
+        self.rotation_180_phase = False       # <-- NOUVEAU : Phase intermédiaire de demi-tour
         self.mission_completed = False
 
-        # ===== CONFIGURATION ROS 2 =====
-        # 1. Action Client vers Nav2 pour gérer le retour au point de départ (0,0)
-        self._nav2_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
+        self.trajectory = []
+        self.current_pose = None
+        self.return_target_index = 0
+        self.yaw_target_180 = 0.0             # <-- NOUVEAU : Cible de la rotation de départ
 
-        # 2. Publisher pour forcer l'arrêt d'urgence des moteurs si nécessaire
+        # Changement du nom du callback pour plus de clarté
+        self.last_sample = time.monotonic()
+
         self.cmd_pub = self.create_publisher(Request, '/api/sport/request', 10)
 
-        # 3. Timer de monitoring de la mission (s'exécute toutes les secondes)
-        self.monitoring_timer = self.create_timer(self.FREQUENCY, self.mission_monitoring_loop)
+        self.create_subscription(Odometry, '/utlidar/robot_odom', self.odom_callback, 10)
 
-        self.get_logger().info('======================================================')
-        self.get_logger().info('🚀 SUPERVISEUR : Mission lancée.')
-        self.get_logger().info('👉 Cartographie active (RTAB-Map).')
-        self.get_logger().info('👉 Évitement d\'obstacles actif (obstacle_avoidance).')
-        self.get_logger().info(f'⏱️ Durée de la phase d\'exploration : {self.MISSION_DURATION:.1f} secondes.')
-        self.get_logger().info('======================================================')
+        self.create_timer(0.5, self.mission_monitoring_loop)
+        self.create_timer(0.1, self.return_control_loop)
+
+        self.get_logger().info('MISSION MANAGER DÉMARRÉ - Mode Fil d\'Ariane actif')
+
+    def odom_callback(self, msg: Odometry):
+        x = msg.pose.pose.position.x
+        y = msg.pose.pose.position.y
+        q = msg.pose.pose.orientation
+        yaw = math.atan2(2 * q.w * q.z, 1 - 2 * q.z * q.z)
+
+        self.current_pose = (x, y, yaw)
+
+        # On n'enregistre la trajectoire que pendant l'aller (Niveau 1)
+        if self.return_phase or self.rotation_180_phase:
+            return
+
+        now = time.monotonic()
+        if now - self.last_sample > 0.4:
+            self.trajectory.append((x, y, yaw))
+            self.last_sample = now
 
     def mission_monitoring_loop(self):
-        """Boucle de surveillance exécutée à 1 Hz (Protégée contre les sauts de temps)"""
-        if self.mission_completed:
+        if self.return_phase or self.rotation_180_phase or self.mission_completed:
             return
 
-        # Calcul du temps écoulé de manière linéaire et sécurisée
-        elapsed_time = time.monotonic() - self.start_time_mono
-        remaining_time = max(0.0, self.MISSION_DURATION - elapsed_time)
+        elapsed = time.monotonic() - self.start_time
 
-        # Log de suivi toutes les 10 secondes (sans risque de doublon ou de saut)
-        if int(elapsed_time) > 0 and int(elapsed_time) % 10 == 0:
-            if not hasattr(self, '_last_log_sec') or self._last_log_sec != int(elapsed_time):
-                self.get_logger().info(
-                    f'⏱️ Statut Mission : Temps écoulé = {elapsed_time:.1f}s | Temps restant = {remaining_time:.1f}s'
-                )
-                self._last_log_sec = int(elapsed_time)
+        if int(elapsed) % 3 == 0:
+            self.get_logger().info(f'[MISSION] Temps écoulé : {elapsed:.1f}s / {self.MISSION_DURATION}s')
 
-        # Condition de déclenchement stricte et inévitable
-        if elapsed_time >= self.MISSION_DURATION:
-            self.get_logger().warn('⏰ CHRONOMÈTRE ÉCOULÉ ! Déclenchement de la phase de retour à la base.')
-            self.monitoring_timer.cancel()  # On coupe le timer de monitoring pour de bon
-            self.trigger_return_to_base()
+        if elapsed >= self.MISSION_DURATION:
+            self.get_logger().warn('='*70)
+            self.get_logger().warn('⏰ FIN DE MISSION → SÉQUENCE DEMI-TOUR 180°')
+            self.get_logger().warn('='*70)
+            self.start_rotation_180_phase()
 
-    def trigger_return_to_base(self):
-        """Prend le contrôle du robot et ordonne le retour au repère d'origine"""
-        self.get_logger().info('⏳ Attente de la synchronisation avec le serveur Nav2...')
-        
-        if not self._nav2_client.wait_for_server(timeout_sec=5.0):
-            self.get_logger().error('❌ Serveur Nav2 indisponible ! Impossible d\'ordonner le retour autonome.')
+    def start_rotation_180_phase(self):
+        """Déclenche le demi-tour pur sur place avant de suivre le chemin"""
+        # ============================================================
+        # ⚡ TUER LE SCRIPT D'ÉVITEMENT D'OBSTACLE POUR ÉVITER LE CONFLIT
+        # ============================================================
+        import os
+        # Cette commande Linux cherche le script d'évitement et le coupe proprement
+        os.system("pkill -f obstacle_avoidance.py")
+        self.get_logger().warn('🛑 SYSTÈME : Évitement d\'obstacle désactivé pour le retour.')
+        # ============================================================
+        if len(self.trajectory) < 5:
+            self.get_logger().error("Trajectoire trop courte !")
             self._emergency_stop()
+            self.mission_completed = True
             return
 
-        # Configuration de l'objectif Nav2 géométrique (Retour à l'origine de la Map)
-        goal_msg = NavigateToPose.Goal()
-        goal_msg.pose.header.frame_id = 'map'
-        goal_msg.pose.header.stamp = self.get_clock().now().to_msg()  # Le stamp du message reste sur l'horloge ROS 2 pour Nav2
-
-        # Coordonnées initiales (X=0.0, Y=0.0, Orientation Neutre)
-        goal_msg.pose.pose.position.x = 0.0
-        goal_msg.pose.pose.position.y = 0.0
-        goal_msg.pose.pose.orientation.w = 1.0
-
-        self.get_logger().warn('🎯 Objectif (0.0, 0.0) envoyé à Nav2. Calcul du chemin optimal de retour en cours...')
-        
-        # Envoi asynchrone de l'objectif
-        self._send_goal_future = self._nav2_client.send_goal_async(
-            goal_msg, 
-            feedback_callback=self._nav2_feedback_callback
-        )
-        self._send_goal_future.add_done_callback(self._nav2_goal_response_callback)
-
-    def _nav2_goal_response_callback(self, future):
-        """Vérifie si Nav2 a accepté ou refusé l'ordre de retour"""
-        goal_handle = future.result()
-        if not goal_handle.accepted:
-            self.get_logger().error('❌ Nav2 a REFUSÉ l\'objectif de retour au point de départ !')
+        if self.current_pose is None:
+            self.get_logger().error("Pas d'odométrie reçue, impossible de pivoter !")
             self._emergency_stop()
+            self.mission_completed = True
             return
 
-        self.get_logger().info('✅ Objectif de retour ACCEPTÉ par Nav2. Le robot fait demi-tour.')
-        self.mission_completed = True
-        self._get_result_future = goal_handle.get_result_async()
-        self._get_result_future.add_done_callback(self._nav2_result_callback)
+        # Calcul du cap inverse à l'orientation actuelle
+        _, _, cyaw = self.current_pose
+        self.yaw_target_180 = math.atan2(math.sin(cyaw + math.pi), math.cos(cyaw + math.pi))
+        
+        self.rotation_180_phase = True
+        self.get_logger().info('🔄 DEMI-TOUR DIRECT : Pivotement sur place vers le chemin du retour...')
 
-    def _nav2_feedback_callback(self, feedback_msg):
-        """Feedback en direct de la trajectoire de retour"""
-        pass
+    def return_control_loop(self):
+        if self.mission_completed or self.current_pose is None:
+            return
 
-    def _nav2_result_callback(self, future):
-        """Exécuté lorsque le robot est physiquement arrivé à destination"""
-        status = future.result().status
-        if status == 4:  # Status Succeeded dans l'API Nav2
-            self.get_logger().info('======================================================')
-            self.get_logger().info('🥳 MISSION RÉUSSIE : Le robot est revenu à sa position initiale !')
-            self.get_logger().info('======================================================')
+        # 1. GESTION DU DEMI-TOUR À 180° DE DÉPART
+        if self.rotation_180_phase:
+            _, _, cyaw = self.current_pose
+            angle_error = math.atan2(math.sin(self.yaw_target_180 - cyaw), math.cos(self.yaw_target_180 - cyaw))
+
+            if abs(angle_error) < self.ANGLE_TOLERANCE:
+                # 180° Réussi ! On bascule sur le suivi de trajectoire inversé
+                self.rotation_180_phase = False
+                self.return_phase = True
+                self.trajectory.reverse() # Inversion du fil d'Ariane
+                self.return_target_index = 0
+                self.get_logger().warn('✅ DEMI-TOUR RÉUSSI : Démarrage du suivi du fil d\'Ariane.')
+                return
+
+            # Envoi de la vitesse de rotation pure sur place
+            vz = self.RETURN_ANGULAR_SPEED if angle_error > 0 else -self.RETURN_ANGULAR_SPEED
+            self._publish_velocity(0.0, vz)
+            return
+
+        # 2. SUIVI DU FIL D'ARIANE EN SENS INVERSE (SUIVANT TON CODE)
+        if not self.return_phase:
+            return
+
+        if self.return_target_index >= len(self.trajectory):
+            self.get_logger().warn('🎯 RETOUR TERMINÉ AVEC SUCCÈS AU REPAIRE D\'ORIGINE')
+            self._emergency_stop()
+            self.mission_completed = True
+            return
+
+        tx, ty, _ = self.trajectory[self.return_target_index]
+        cx, cy, cyaw = self.current_pose
+
+        dx = tx - cx
+        dy = ty - cy
+        distance = math.hypot(dx, dy)
+
+        if distance < self.POSITION_TOLERANCE:
+            self.get_logger().info(f'📍 Point {self.return_target_index}/{len(self.trajectory)} atteint')
+            self.return_target_index += 1
+            return
+
+        target_angle = math.atan2(dy, dx)
+        angle_error = math.atan2(math.sin(target_angle - cyaw), math.cos(target_angle - cyaw))
+
+        if abs(angle_error) > self.ANGLE_TOLERANCE:
+            vz = self.RETURN_ANGULAR_SPEED if angle_error > 0 else -self.RETURN_ANGULAR_SPEED
+            self._publish_velocity(0.0, vz)
+            self.get_logger().info(f'↩️ Alignement vers point suivant | err={math.degrees(angle_error):.1f}°')
         else:
-            self.get_logger().error(f'⚠️ Échec de la trajectoire de retour autonome. Code statut Nav2 : {status}')
-        self._emergency_stop()
+            vz = max(-0.6, min(0.6, angle_error * 2.5))
+            self._publish_velocity(self.RETURN_LINEAR_SPEED, vz)
+            self.get_logger().info(f'➡️ Avance | dist={distance:.2f}m')
+
+    def _publish_velocity(self, vx, vz):
+        """Centralisation de l'envoi vers le SDK Sport (Corrigé à 1008)"""
+        req = Request()
+        req.header.identity.id = 1
+        req.header.identity.api_id = 1008  # !!! CORRIGÉ : 1008 = Vitesse Sport (1005 faisait coucher le robot)
+        vel = {"x": vx, "y": 0.0, "z": vz}
+        req.parameter = json.dumps(vel)
+        self.cmd_pub.publish(req)
 
     def _emergency_stop(self):
-        """Sécurité : Force l'immobilisation des moteurs du Unitree Go2"""
-        self.get_logger().info('🛑 Immobilisation des moteurs.')
-        msg = Request()
-        msg.header.identity.id = 1
-        msg.header.identity.api_id = 1008  # SDK Sport Unitree (vitesse)
-        msg.parameter = json.dumps({"x": 0.0, "y": 0.0, "z": 0.0})
-        self.cmd_pub.publish(msg)
+        """Force l'immobilisation complète du robot (Corrigé à 1008)"""
+        req = Request()
+        req.header.identity.id = 1
+        req.header.identity.api_id = 1008  # !!! CORRIGÉ : 1008
+        req.parameter = json.dumps({"x": 0.0, "y": 0.0, "z": 0.0})
+        self.cmd_pub.publish(req)
+
+    def destroy_node(self):
+        self._emergency_stop()
+        super().destroy_node()
 
 
 def main(args=None):
@@ -134,10 +188,11 @@ def main(args=None):
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-        node.get_logger().info('Superviseur arrêté par l\'utilisateur.')
+        node.get_logger().info('Mission arrêtée manuellement')
     finally:
         node.destroy_node()
         rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()
