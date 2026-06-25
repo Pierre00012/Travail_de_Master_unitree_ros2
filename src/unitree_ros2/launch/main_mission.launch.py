@@ -7,14 +7,12 @@ from ament_index_python.packages import get_package_share_directory
 
 
 def generate_launch_description():
-
-    # Récupération du dossier partagé de ton package
     pkg_dir = get_package_share_directory('unitree_ros2') 
 
     return LaunchDescription([
 
         # ============================================================
-        # 1. Cartographie (Ton fichier LIO-SLAM existant)
+        # 1. Cartographie 
         # ============================================================
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(
@@ -23,14 +21,14 @@ def generate_launch_description():
         ),
 
         # ============================================================
-        # 2. Évitement d'obstacles (Scripts Python installés)
+        # 2. Évitement d'obstacles 
         # ============================================================
         TimerAction(
             period=2.0,
             actions=[
                 Node(
                     package='unitree_ros2',
-                    executable='obstacle_avoidance.py', # Doit correspondre au nom dans CMakeLists
+                    executable='obstacle_avoidance.py', 
                     name='obstacle_avoidance',
                     output='screen',
                 )
@@ -45,8 +43,7 @@ def generate_launch_description():
             actions=[
                 Node(
                     package='unitree_ros2',
-                    executable='mission_manager.py', # Doit correspondre au nom dans CMakeLists
-                    name='mission_manager',
+                    executable='mission_manager.py', 
                     output='screen',
                 )
             ]

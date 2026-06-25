@@ -6,7 +6,7 @@ from rclpy.action import ActionClient
 from nav2_msgs.action import NavigateToPose
 from unitree_api.msg import Request
 import json
-import time
+import time  # Utilisé pour time.monotonic()
 
 class MissionManager(Node):
 
@@ -14,11 +14,12 @@ class MissionManager(Node):
         super().__init__('mission_manager')
 
         # ===== CONFIGURATION =====
-        self.MISSION_DURATION = 300.0  # 5 minutes en secondes
+        self.MISSION_DURATION = 60.0  # Durée de la mission en secondes
         self.FREQUENCY = 1.0           # Fréquence du monitoring (1 Hz)
 
-        # ===== ETAT INTERNE =====
-        self.start_time = time.time()
+        # ===== ETAT INTERNE IMMUNISÉ =====
+        # time.monotonic() renvoie le temps brut du CPU, insensible aux sauts de temps
+        self.start_time_mono = time.monotonic()
         self.mission_completed = False
 
         # ===== CONFIGURATION ROS 2 =====
@@ -35,27 +36,30 @@ class MissionManager(Node):
         self.get_logger().info('🚀 SUPERVISEUR : Mission lancée.')
         self.get_logger().info('👉 Cartographie active (RTAB-Map).')
         self.get_logger().info('👉 Évitement d\'obstacles actif (obstacle_avoidance).')
-        self.get_logger().info(f'⏱️ Durée de la phase d\'exploration : {self.MISSION_DURATION/60:.1f} minutes.')
+        self.get_logger().info(f'⏱️ Durée de la phase d\'exploration : {self.MISSION_DURATION:.1f} secondes.')
         self.get_logger().info('======================================================')
 
     def mission_monitoring_loop(self):
-        """Boucle de surveillance exécutée à 1 Hz"""
+        """Boucle de surveillance exécutée à 1 Hz (Protégée contre les sauts de temps)"""
         if self.mission_completed:
             return
 
-        elapsed_time = time.time() - self.start_time
+        # Calcul du temps écoulé de manière linéaire et sécurisée
+        elapsed_time = time.monotonic() - self.start_time_mono
         remaining_time = max(0.0, self.MISSION_DURATION - elapsed_time)
 
-        # Log de suivi régulier
-        if int(elapsed_time) % 10 == 0:
-            self.get_logger().info(
-                f'⏱️ Statut Mission : Temps écoulé = {elapsed_time:.1f}s | Temps restant = {remaining_time:.1f}s'
-            )
+        # Log de suivi toutes les 10 secondes (sans risque de doublon ou de saut)
+        if int(elapsed_time) > 0 and int(elapsed_time) % 10 == 0:
+            if not hasattr(self, '_last_log_sec') or self._last_log_sec != int(elapsed_time):
+                self.get_logger().info(
+                    f'⏱️ Statut Mission : Temps écoulé = {elapsed_time:.1f}s | Temps restant = {remaining_time:.1f}s'
+                )
+                self._last_log_sec = int(elapsed_time)
 
-        # Condition de déclenchement du retour à la base
+        # Condition de déclenchement stricte et inévitable
         if elapsed_time >= self.MISSION_DURATION:
             self.get_logger().warn('⏰ CHRONOMÈTRE ÉCOULÉ ! Déclenchement de la phase de retour à la base.')
-            self.monitoring_timer.cancel() # On coupe le timer de monitoring
+            self.monitoring_timer.cancel()  # On coupe le timer de monitoring pour de bon
             self.trigger_return_to_base()
 
     def trigger_return_to_base(self):
@@ -69,8 +73,8 @@ class MissionManager(Node):
 
         # Configuration de l'objectif Nav2 géométrique (Retour à l'origine de la Map)
         goal_msg = NavigateToPose.Goal()
-        goal_msg.pose.header.frame_id = 'map' # Repère global de la carte générée par ton lio_slam
-        goal_msg.pose.header.stamp = self.get_clock().now().to_msg()
+        goal_msg.pose.header.frame_id = 'map'
+        goal_msg.pose.header.stamp = self.get_clock().now().to_msg()  # Le stamp du message reste sur l'horloge ROS 2 pour Nav2
 
         # Coordonnées initiales (X=0.0, Y=0.0, Orientation Neutre)
         goal_msg.pose.pose.position.x = 0.0
@@ -94,22 +98,19 @@ class MissionManager(Node):
             self._emergency_stop()
             return
 
-        self.get_logger().info('✅ Objectif de retour ACCÉPTÉ par Nav2. Le robot fait demi-tour.')
+        self.get_logger().info('✅ Objectif de retour ACCEPTÉ par Nav2. Le robot fait demi-tour.')
         self.mission_completed = True
         self._get_result_future = goal_handle.get_result_async()
         self._get_result_future.add_done_callback(self._nav2_result_callback)
 
     def _nav2_feedback_callback(self, feedback_msg):
         """Feedback en direct de la trajectoire de retour"""
-        feedback = feedback_msg.feedback
-        # Optionnel : Tu peux logger la distance restante ici si nécessaire
-        # self.get_logger().info(f'Distance restante : {feedback.distance_remaining:.2f}m')
         pass
 
     def _nav2_result_callback(self, future):
         """Exécuté lorsque le robot est physiquement arrivé à destination"""
         status = future.result().status
-        if status == 4: # Status Succeeded dans l'API Nav2
+        if status == 4:  # Status Succeeded dans l'API Nav2
             self.get_logger().info('======================================================')
             self.get_logger().info('🥳 MISSION RÉUSSIE : Le robot est revenu à sa position initiale !')
             self.get_logger().info('======================================================')
@@ -122,7 +123,7 @@ class MissionManager(Node):
         self.get_logger().info('🛑 Immobilisation des moteurs.')
         msg = Request()
         msg.header.identity.id = 1
-        msg.header.identity.api_id = 1008 # SDK Sport Unitree (vitesse)
+        msg.header.identity.api_id = 1008  # SDK Sport Unitree (vitesse)
         msg.parameter = json.dumps({"x": 0.0, "y": 0.0, "z": 0.0})
         self.cmd_pub.publish(msg)
 
