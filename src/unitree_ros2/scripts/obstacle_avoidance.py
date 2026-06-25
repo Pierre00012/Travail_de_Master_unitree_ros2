@@ -14,7 +14,7 @@ class ObstacleAvoidance(Node):
 
     # CONSTANTES - Tuning du robot
     OBSTACLE_DISTANCE = 1.2
-    CRITICAL_DISTANCE = 0.7
+    CRITICAL_DISTANCE = 0.5
     MIN_LIDAR_DISTANCE = 0.5
     LIDAR_MAX_X = -0.35
     LIDAR_MAX_Y = 0.30
