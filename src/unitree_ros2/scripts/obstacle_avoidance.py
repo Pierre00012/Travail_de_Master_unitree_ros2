@@ -23,7 +23,7 @@ class ObstacleAvoidance(Node):
     LIDAR_MIN_Z = 0.0
     LIDAR_MAX_Z = 0.25
     
-    # AJUSTEMENT 1 : Extension du couloir central à 16cm (32cm au total) pour couvrir la largeur réelle du châssis
+    # AJUSTEMENT 1 :  pour couvrir la largeur réelle du châssis
     LIDAR_CENTER_MARGIN = 0.16
     
     STARTUP_DELAY = 10.0
@@ -51,7 +51,7 @@ class ObstacleAvoidance(Node):
         self.right_dist        = 999.0
         self.front_dist        = 999.0
 
-        # Initialisation de ton compteur de reculs successifs
+        # Initialisation du compteur de reculs successifs
         self.recul_count = 0
 
         # Machine d'état

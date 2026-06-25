@@ -7,30 +7,31 @@ from nav_msgs.msg import Odometry
 import json
 import time
 import math
+import os  
 
 class MissionManager(Node):
     def __init__(self):
         super().__init__('mission_manager')
 
         # ==================== CONFIG ====================
-        self.MISSION_DURATION = 30.0          # secondes
-        self.RETURN_LINEAR_SPEED = 0.22
-        self.RETURN_ANGULAR_SPEED = 1.2       # Rotation plus forte
-        self.POSITION_TOLERANCE = 0.25
-        self.ANGLE_TOLERANCE = 0.20
+        self.MISSION_DURATION = 25.0          # secondes
+        self.RETURN_LINEAR_SPEED = 0.25       
+        self.RETURN_ANGULAR_SPEED = 1.2       # Vitesse de rotation robuste
+        
+        # AJUSTEMENT CRITIQUE : Tolérance élargie à 38 cm 
+        self.POSITION_TOLERANCE = 0.38        
+        self.ANGLE_TOLERANCE = 0.18           
 
-        # Remplacement par time.monotonic() pour la stabilité réseau
         self.start_time = time.monotonic()
         self.return_phase = False
-        self.rotation_180_phase = False       # <-- NOUVEAU : Phase intermédiaire de demi-tour
+        self.rotation_180_phase = False       # Phase intermédiaire de demi-tour
         self.mission_completed = False
 
         self.trajectory = []
         self.current_pose = None
         self.return_target_index = 0
-        self.yaw_target_180 = 0.0             # <-- NOUVEAU : Cible de la rotation de départ
+        self.yaw_target_180 = 0.0             
 
-        # Changement du nom du callback pour plus de clarté
         self.last_sample = time.monotonic()
 
         self.cmd_pub = self.create_publisher(Request, '/api/sport/request', 10)
@@ -40,7 +41,7 @@ class MissionManager(Node):
         self.create_timer(0.5, self.mission_monitoring_loop)
         self.create_timer(0.1, self.return_control_loop)
 
-        self.get_logger().info('MISSION MANAGER DÉMARRÉ - Mode Fil d\'Ariane actif')
+        self.get_logger().info('🚀 MISSION MANAGER DÉMARRÉ - Mode Fil d\'Ariane fluide actif')
 
     def odom_callback(self, msg: Odometry):
         x = msg.pose.pose.position.x
@@ -50,8 +51,7 @@ class MissionManager(Node):
 
         self.current_pose = (x, y, yaw)
 
-        # On n'enregistre la trajectoire que pendant l'aller (Niveau 1)
-        if self.return_phase or self.rotation_180_phase:
+        if self.return_phase or self.rotation_180_phase or self.mission_completed:
             return
 
         now = time.monotonic()
@@ -76,16 +76,8 @@ class MissionManager(Node):
 
     def start_rotation_180_phase(self):
         """Déclenche le demi-tour pur sur place avant de suivre le chemin"""
-        # ============================================================
-        # ⚡ TUER LE SCRIPT D'ÉVITEMENT D'OBSTACLE POUR ÉVITER LE CONFLIT
-        # ============================================================
-        import os
-        # Cette commande Linux cherche le script d'évitement et le coupe proprement
-        os.system("pkill -f obstacle_avoidance.py")
-        self.get_logger().warn('🛑 SYSTÈME : Évitement d\'obstacle désactivé pour le retour.')
-        # ============================================================
         if len(self.trajectory) < 5:
-            self.get_logger().error("Trajectoire trop courte !")
+            self.get_logger().error("Trajectoire aller trop courte pour générer un retour !")
             self._emergency_stop()
             self.mission_completed = True
             return
@@ -96,7 +88,10 @@ class MissionManager(Node):
             self.mission_completed = True
             return
 
-        # Calcul du cap inverse à l'orientation actuelle
+        # Libération immédiate du topic /api/sport/request
+        os.system("pkill -f obstacle_avoidance.py")
+        self.get_logger().warn('🛑 SYSTÈME : Évitement d\'obstacle coupé pour libérer la bande passante.')
+
         _, _, cyaw = self.current_pose
         self.yaw_target_180 = math.atan2(math.sin(cyaw + math.pi), math.cos(cyaw + math.pi))
         
@@ -107,31 +102,28 @@ class MissionManager(Node):
         if self.mission_completed or self.current_pose is None:
             return
 
-        # 1. GESTION DU DEMI-TOUR À 180° DE DÉPART
+        # 1. PHASE DE DEMI-TOUR INITIAL À 180°
         if self.rotation_180_phase:
             _, _, cyaw = self.current_pose
             angle_error = math.atan2(math.sin(self.yaw_target_180 - cyaw), math.cos(self.yaw_target_180 - cyaw))
 
             if abs(angle_error) < self.ANGLE_TOLERANCE:
-                # 180° Réussi ! On bascule sur le suivi de trajectoire inversé
                 self.rotation_180_phase = False
                 self.return_phase = True
-                self.trajectory.reverse() # Inversion du fil d'Ariane
+                self.trajectory.reverse()  # Inversion du fil d'Ariane
                 self.return_target_index = 0
-                self.get_logger().warn('✅ DEMI-TOUR RÉUSSI : Démarrage du suivi du fil d\'Ariane.')
+                self.get_logger().warn('✅ DEMI-TOUR RÉUSSI : Démarrage direct du suivi de ligne.')
+            else:
+                vz = self.RETURN_ANGULAR_SPEED if angle_error > 0 else -self.RETURN_ANGULAR_SPEED
+                self._publish_velocity(0.0, vz)
                 return
 
-            # Envoi de la vitesse de rotation pure sur place
-            vz = self.RETURN_ANGULAR_SPEED if angle_error > 0 else -self.RETURN_ANGULAR_SPEED
-            self._publish_velocity(0.0, vz)
-            return
-
-        # 2. SUIVI DU FIL D'ARIANE EN SENS INVERSE (SUIVANT TON CODE)
+        # 2. RETOUR LE LONG DU FIL D'ARIANE (REJOUR LES POINTS ENREGISTRÉS EN SENS INVERSE)
         if not self.return_phase:
             return
 
         if self.return_target_index >= len(self.trajectory):
-            self.get_logger().warn('🎯 RETOUR TERMINÉ AVEC SUCCÈS AU REPAIRE D\'ORIGINE')
+            self.get_logger().warn('🎯 RETOUR TERMINÉ AVEC SUCCÈS AU POINT DE DÉPART')
             self._emergency_stop()
             self.mission_completed = True
             return
@@ -143,37 +135,57 @@ class MissionManager(Node):
         dy = ty - cy
         distance = math.hypot(dx, dy)
 
-        if distance < self.POSITION_TOLERANCE:
-            self.get_logger().info(f'📍 Point {self.return_target_index}/{len(self.trajectory)} atteint')
+        # Nettoyage instantané des points morts sous la nouvelle tolérance (0.38m)
+        while distance < self.POSITION_TOLERANCE:
+            self.get_logger().info(f'📍 Point {self.return_target_index} validé ({distance:.2f}m). Passage au suivant.')
             self.return_target_index += 1
-            return
+            
+            if self.return_target_index >= len(self.trajectory):
+                self.get_logger().warn('🎯 RETOUR TERMINÉ : Fin de la liste de points.')
+                self._emergency_stop()
+                self.mission_completed = True
+                return
+                
+            tx, ty, _ = self.trajectory[self.return_target_index]
+            dx = tx - cx
+            dy = ty - cy
+            distance = math.hypot(dx, dy)
 
+        # Calcul des angles vers la cible valide
         target_angle = math.atan2(dy, dx)
         angle_error = math.atan2(math.sin(target_angle - cyaw), math.cos(target_angle - cyaw))
 
-        if abs(angle_error) > self.ANGLE_TOLERANCE:
+        # AMÉLIORATION COMPORTEMENTALE : Loi de commande adaptative (Look-Ahead Speed)
+        if abs(angle_error) > 0.45:  # Virage très serré (> 25°)
+            # On stoppe la marche avant et on privilégie une rotation pure pour ne pas dévier du fil
             vz = self.RETURN_ANGULAR_SPEED if angle_error > 0 else -self.RETURN_ANGULAR_SPEED
             self._publish_velocity(0.0, vz)
-            self.get_logger().info(f'↩️ Alignement vers point suivant | err={math.degrees(angle_error):.1f}°')
-        else:
-            vz = max(-0.6, min(0.6, angle_error * 2.5))
+            self.get_logger().info(f'↩️ Pivotement fort vers point #{self.return_target_index} | err={math.degrees(angle_error):.1f}°')
+        
+        elif abs(angle_error) > self.ANGLE_TOLERANCE:  # Ajustement léger de trajectoire
+            # On avance doucement tout en appliquant la rotation pour fluidifier le mouvement
+            vz = self.RETURN_ANGULAR_SPEED * 0.7 if angle_error > 0 else -self.RETURN_ANGULAR_SPEED * 0.7
+            self._publish_velocity(self.RETURN_LINEAR_SPEED * 0.4, vz)
+            self.get_logger().info(f'🔄 Courbe d\'ajustement vers point #{self.return_target_index}')
+        
+        else:  # Alignement parfait
+            # Pleine vitesse en ligne droite
+            vz = angle_error * 2.0
             self._publish_velocity(self.RETURN_LINEAR_SPEED, vz)
-            self.get_logger().info(f'➡️ Avance | dist={distance:.2f}m')
+            self.get_logger().info(f'➡️ Ligne droite nominale | dist={distance:.2f}m')
 
     def _publish_velocity(self, vx, vz):
-        """Centralisation de l'envoi vers le SDK Sport (Corrigé à 1008)"""
         req = Request()
         req.header.identity.id = 1
-        req.header.identity.api_id = 1008  # !!! CORRIGÉ : 1008 = Vitesse Sport (1005 faisait coucher le robot)
+        req.header.identity.api_id = 1008  # Commande de déplacement matériel d'usine
         vel = {"x": vx, "y": 0.0, "z": vz}
         req.parameter = json.dumps(vel)
         self.cmd_pub.publish(req)
 
     def _emergency_stop(self):
-        """Force l'immobilisation complète du robot (Corrigé à 1008)"""
         req = Request()
         req.header.identity.id = 1
-        req.header.identity.api_id = 1008  # !!! CORRIGÉ : 1008
+        req.header.identity.api_id = 1008
         req.parameter = json.dumps({"x": 0.0, "y": 0.0, "z": 0.0})
         self.cmd_pub.publish(req)
 
@@ -188,7 +200,7 @@ def main(args=None):
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-        node.get_logger().info('Mission arrêtée manuellement')
+        node.get_logger().info('Mission arrêtée manuellement.')
     finally:
         node.destroy_node()
         rclpy.shutdown()
