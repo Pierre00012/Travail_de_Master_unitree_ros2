@@ -14,7 +14,7 @@ class ObstacleAvoidance(Node):
 
     # CONSTANTES - Tuning du robot
     OBSTACLE_DISTANCE = 1.2
-    CRITICAL_DISTANCE = 0.5
+    CRITICAL_DISTANCE = 0.7 
     MIN_LIDAR_DISTANCE = 0.5
     LIDAR_MAX_X = -0.35
     LIDAR_MAX_Y = 0.30
@@ -22,10 +22,8 @@ class ObstacleAvoidance(Node):
     LIDAR_BLIND_ZONE_Y = 0.45
     LIDAR_MIN_Z = 0.0
     LIDAR_MAX_Z = 0.25
-    
-    # AJUSTEMENT 1 :  pour couvrir la largeur réelle du châssis
-    LIDAR_CENTER_MARGIN = 0.16
-    
+    LIDAR_CENTER_MARGIN = 0.16  # Largeur sécurisée pour protéger les flancs
+
     STARTUP_DELAY = 10.0
     HISTORY_SIZE = 5
     DANGER_999_THRESHOLD = 5
@@ -59,8 +57,10 @@ class ObstacleAvoidance(Node):
         self.start_time = time.time()
         self.escape_start_time = 0.0
         
-        # Navigation
+        # Navigation et Historiques de lissage
         self.turn_direction = 0.0
+        self.front_history = []         # <-- NOUVEAU : Historique brut du centre
+        self.front_average_history = [] # <-- NOUVEAU : Historique des moyennes pour détecter le gel
         self.left_history = []
         self.right_history = []
         self.direction_lock = 0
@@ -111,9 +111,9 @@ class ObstacleAvoidance(Node):
         points = list(point_cloud2.read_points(
             msg, field_names=("x", "y", "z"), skip_nans=True))
 
-        front_dist = 999.0
-        left_dist  = 999.0
-        right_dist = 999.0
+        front_raw = 999.0
+        left_raw  = 999.0
+        right_raw = 999.0
 
         for p in points:
             x, y, z = p
@@ -132,36 +132,44 @@ class ObstacleAvoidance(Node):
 
             # Zone centrale élargie pour intercepter les obstacles face aux flancs
             if abs(y) < self.LIDAR_CENTER_MARGIN:
-                front_dist = min(front_dist, d)
+                front_raw = min(front_raw, d)
             
             # Zone gauche et droite
             if y >= 0:
-                left_dist = min(left_dist, d)
+                left_raw = min(left_raw, d)
             else:
-                right_dist = min(right_dist, d)
+                right_raw = min(right_raw, d)
 
-        self.front_dist = front_dist
+        # ----- NOUVELLE LOGIQUE DE TRAITEMENT DU CENTRE -----
+        self.front_history.append(front_raw)
+        if len(self.front_history) > self.HISTORY_SIZE:
+            self.front_history.pop(0)
+        
+        # Mettre à jour la moyenne glissante courante de face
+        self.front_dist = self.smooth(self.front_history)
 
-        # Détection danger 999.00 persistant uniquement si la situation est vraiment bloquante
-        if front_dist >= 999.0:
-            blocked_left = left_dist <= self.OBSTACLE_DISTANCE
-            blocked_right = right_dist <= self.OBSTACLE_DISTANCE
-            critical_left = left_dist <= self.CRITICAL_DISTANCE
-            critical_right = right_dist <= self.CRITICAL_DISTANCE
+        # Sauvegarde de cette moyenne dans l'historique de stabilité (taille 5)
+        self.front_average_history.append(self.front_dist)
+        if len(self.front_average_history) > 5:
+            self.front_average_history.pop(0)
 
-            if ((critical_left and blocked_right) or
-                (critical_right and blocked_left) or
-                (blocked_left and blocked_right) or
-                (critical_left and critical_right)):
-                self.danger_999_count += 1
-            else:
-                self.danger_999_count = 0
+        # Vérification si la moyenne est restée strictement identique (à 1 mm près) 5 fois de suite
+        is_frozen = False
+        if len(self.front_average_history) == 5:
+            premiere_valeur = self.front_average_history[0]
+            # Si toutes les moyennes de la liste sont quasi-égales à la première
+            if all(math.isclose(val, premiere_valeur, abs_tol=0.001) for val in self.front_average_history):
+                is_frozen = True
+
+        # Arbitrage du blocage (Remplace l'ancienne condition stricte front_dist >= 999)
+        if is_frozen:
+            self.danger_999_count += 1
         else:
             self.danger_999_count = 0
 
-        # Lissage avec history
-        self.left_history.append(left_dist)
-        self.right_history.append(right_dist)
+        # Lissage latéral classique avec history
+        self.left_history.append(left_raw)
+        self.right_history.append(right_raw)
 
         if len(self.left_history) > self.HISTORY_SIZE:
             self.left_history.pop(0)
@@ -174,7 +182,7 @@ class ObstacleAvoidance(Node):
         # Log une fois par seconde
         if time.time() - self.last_init_log > 1.0:
             self.get_logger().info(
-                f'front={front_dist:.2f}m | gauche={self.left_dist:.2f}m | droite={self.right_dist:.2f}m | reculs={self.recul_count}'
+                f'front={self.front_dist:.2f}m | gauche={self.left_dist:.2f}m | droite={self.right_dist:.2f}m | reculs={self.recul_count}'
             )
             self.last_init_log = time.time()
 
@@ -210,10 +218,10 @@ class ObstacleAvoidance(Node):
             self._escape_sequence(self.escape_start_time, 'danger')
             return
 
-        # DANGER CRITIQUE: 999.00 persistant
+        # DANGER CRITIQUE INTERCEPTÉ PAR LA MOYENNE FIGÉE CONSECUTIVE
         if self.danger_999_count >= self.DANGER_999_THRESHOLD:
             self.get_logger().info(
-                f'🚨🚨 DANGER CRITIQUE ({self.danger_999_count} obs 999) - RECUL URGENT'
+                f'🚨🚨 ROBOT COINCÉ (Moyenne figée à {self.front_dist:.2f}m) - RECUL URGENT'
             )
             self._publish_velocity(0.0, 0.0)
             self.state = 'ESCAPE_DANGER'
@@ -231,7 +239,6 @@ class ObstacleAvoidance(Node):
 
         # CAS 1: voie libre
         if front > self.OBSTACLE_DISTANCE:
-            # Remise à zéro uniquement quand on reprend une avancée normale sans obstacle
             if self.recul_count > 0:
                 self.get_logger().info('🟢 Espace libre devant. Remise à zéro du compteur de recul.')
                 self.recul_count = 0
@@ -246,27 +253,37 @@ class ObstacleAvoidance(Node):
             self._publish_velocity(self.SPEED_MIN_FORWARD, vz)
             return
 
-        # CAS 2: obstacle détecté à distance
+        # CAS 2: obstacle détecté à distance tranquille
         if front > self.CRITICAL_DISTANCE:
             self._navigate_with_obstacle(front, left, right)
             return
 
-        # CAS 3: danger immédiat (Appel direct de ta stratégie comportementale)
+        # ============================================================
+        # 🧠 CAS 3 AJUSTÉ : INTERVALLE DE DANGER IMMÉDIAT [0.70m - 0.50m]
+        # ============================================================
+        if front > self.MIN_LIDAR_DISTANCE:
+            self.get_logger().info(f'⚠ INTERVALLE DANGER ({front:.2f}m) : Esquive limite de face.')
+            
+            if self.direction_lock == 0:
+                self._update_turn_direction(left, right)
+                
+            self._publish_velocity(self.SPEED_MIN_FORWARD, self.turn_direction * self.SPEED_TURN_ESCAPE)
+            return
+
+        # L'obstacle passe sous ou égale les 0.50m
         self._gerer_strategie_recul(front)
 
     def _gerer_strategie_recul(self, front):
         """Fonction dédiée orchestrant les actions selon le nombre de reculs successifs"""
         self.recul_count += 1
-        self.get_logger().warn(f'🚨 DANGER {front:.2f}m - Incrémentation du compteur de recul (#{self.recul_count})')
+        self.get_logger().warn(f'🚨 DANGER CORPS {front:.2f}m - Incrémentation du compteur de recul (#{self.recul_count})')
         
-        # Arrêt préventif des moteurs avant de basculer sur l'action appropriée
         self._publish_velocity(0.0, 0.0)
         self.state = 'ESCAPE_DANGER'
         self.escape_start_time = time.time()
 
     def _navigate_with_obstacle(self, front, left, right):
         """Gère la navigation avec obstacle détecté (CAS 2)"""
-        # Gestion du verrou de direction
         if self.direction_lock != 0:
             if time.time() - self.lock_time < self.DIRECTION_LOCK_DURATION:
                 self.turn_direction = float(self.direction_lock)
@@ -275,11 +292,9 @@ class ObstacleAvoidance(Node):
         else:
             self._update_turn_direction(left, right)
 
-        # Calcul des vitesses proportionnelles
         ratio = (front - self.CRITICAL_DISTANCE) / (self.OBSTACLE_DISTANCE - self.CRITICAL_DISTANCE)
         vx = self.SPEED_MIN_FORWARD + ratio * (self.SPEED_MAX_FORWARD - self.SPEED_MIN_FORWARD)
         
-        # AJUSTEMENT POUR LE PALIER 2 : Élargissement dynamique du contournement
         if self.recul_count == 2:
             vz = self.turn_direction * self.SPEED_TURN_ESCAPE * 1.3
         elif front < 1.0:
@@ -302,7 +317,6 @@ class ObstacleAvoidance(Node):
                 self.direction_lock = 1
                 self.lock_time = time.time()
         else:
-            # SÉLECTION DU PALIER 2 : Choix automatique du côté offrant le maximum de dégagement
             if self.recul_count == 2:
                 new_direction = 1.0 if left >= right else -1.0
                 self.direction_lock = 1 if left >= right else -1
@@ -322,28 +336,22 @@ class ObstacleAvoidance(Node):
                                    new_direction * self.SMOOTH_BLEND_FACTOR)
 
     def _escape_sequence(self, start_time, escape_type):
-        """Séquence unifiée de dégagement: recul + rotation + vérification"""
+        """Séquence unifiée de dégagement modifiée pour intercepter le 3ème et les suivants"""
         elapsed = time.time() - start_time
         phase_times = {
-            'startup': (2.0, 4.0),  # phase1_end, phase2_end
+            'startup': (2.0, 4.0),
             'danger': (self.ESCAPE_PHASE1_DURATION, 
                       self.ESCAPE_PHASE1_DURATION + self.ESCAPE_PHASE2_DURATION)
         }
         phase1_end, phase2_end = phase_times.get(escape_type, phase_times['danger'])
 
-        # ============================================================
-        # 🧠 LOGIQUE INTÉGRÉE POUR LE PALIER 3 ET LE PALIER 4 (PAS DE 30°)
-        # ============================================================
         if self.recul_count >= 3 and escape_type == 'danger':
-            # Palier 3 : Côté le plus libre (Natif) | Palier 4 : Côté opposé pour casser la boucle
             direction_panoramique = self._get_rotation_direction()
             direction_rotation = direction_panoramique if self.recul_count == 3 else -direction_panoramique
             
-            # Simulation géométrique des pas : Un pas de 30° prend ~0.65 seconde à vitesse nominale
             index_etape = int(elapsed / 0.65)
             
-            if index_etape < 3: # 3 étapes successives de 30° = rotation de 90°
-                # VÉRIFICATION CONTINUE : Si l'espace se libère au pas actuel, on sort instantanément !
+            if index_etape < 3: 
                 if (self.front_dist > self.OBSTACLE_DISTANCE and
                     self.left_dist > self.CRITICAL_DISTANCE and
                     self.right_dist > self.CRITICAL_DISTANCE):
@@ -352,44 +360,37 @@ class ObstacleAvoidance(Node):
                     self.state = 'RUNNING'
                     return
                 
-                # Exécution du pas de rotation en cours
                 self.get_logger().info(f'🔄 Palier #{self.recul_count} : Pivot progressif 90° (Étape {index_etape + 1}/3)')
                 self._publish_velocity(0.0, direction_rotation * self.SPEED_TURN_ESCAPE)
                 return
             else:
-                # Fin des 3 étapes de 30°, on repasse en traitement standard
                 self.state = 'RUNNING'
                 return
 
-        # ============================================================
-        # 🚨 PALIER 1 : MANŒUVRE CLASSIQUE DE TON CODE ORIGINAL
-        # ============================================================
-        # Phase 1: Recul
+        # Phase 1: Recul normal
         if elapsed < phase1_end:
             self.get_logger().info(f'🚨 Recul dégagement ({elapsed:.1f}s)')
             self._publish_velocity(self.SPEED_BACKWARD, 0.0)
 
-        # Phase 2: Rotation
+        # Phase 2: Rotation normale
         elif elapsed < phase2_end:
             self.get_logger().info('↩️ Rotation dégagement')
             vz = self._get_rotation_direction() * self.SPEED_TURN_ESCAPE
             self._publish_velocity(0.0, vz)
 
-        # Phase 3: Vérification + retry
+        # Phase 3: Vérification standard
         else:
             if elapsed > self.ESCAPE_TOTAL_TIMEOUT:
                 self.get_logger().warn('⏱️ Timeout dégagement - forcer continuation')
                 self.state = 'RUNNING'
                 return
 
-            # Vérifier voie libre
             if (self.front_dist > self.OBSTACLE_DISTANCE and
                 self.left_dist > self.CRITICAL_DISTANCE and
                 self.right_dist > self.CRITICAL_DISTANCE):
                 self.get_logger().info('✅ Dégagement réussi!')
                 self.state = 'RUNNING'
             else:
-                # Continuer rotation
                 self.get_logger().info(
                     f'Voie obstruée (F:{self.front_dist:.2f} L:{self.left_dist:.2f} R:{self.right_dist:.2f}) - rotation'
                 )
